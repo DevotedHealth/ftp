@@ -3,7 +3,9 @@ package ftp
 import (
 	"bytes"
 	"crypto/tls"
+	"fmt"
 	"io/ioutil"
+	"net"
 	"net/textproto"
 	"os"
 	"strings"
@@ -212,7 +214,11 @@ func testConn(t *testing.T, disableEPSV bool, implicitTLS bool) {
 
 	err = c.Logout()
 	if err != nil {
-		if protoErr := err.(*textproto.Error); protoErr != nil {
+		if opErr := err.(*net.OpError); opErr != nil {
+			fmt.Println(opErr)
+			fmt.Println(opErr.Op, opErr.Net, opErr.Source, opErr.Addr, opErr)
+			t.Error(err)
+		} else if protoErr := err.(*textproto.Error); protoErr != nil {
 			if protoErr.Code != StatusNotImplemented {
 				t.Error(err)
 			}
