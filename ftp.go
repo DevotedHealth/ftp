@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/textproto"
@@ -25,11 +26,22 @@ const (
 	EntryTypeLink
 )
 
+var entryTypeMap = map[EntryType]string{
+	0: "File",
+	1: "Folder",
+	2: "Link",
+}
+
+func (e EntryType) String() string {
+	return entryTypeMap[e]
+}
+
 // ServerConn represents the connection to a remote FTP server.
 // It should be protected from concurrent accesses.
 type ServerConn struct {
 	// Do not use EPSV mode
 	DisableEPSV bool
+	Debug       bool
 
 	// Timezone that the server is in
 	Location *time.Location
@@ -39,6 +51,7 @@ type ServerConn struct {
 	timeout       time.Duration
 	features      map[string]string
 	mlstSupported bool
+	tlsconfig     *tls.Config
 }
 
 // Entry describes a file and is returned by List().
@@ -47,6 +60,14 @@ type Entry struct {
 	Type EntryType
 	Size uint64
 	Time time.Time
+}
+
+func (e Entry) String() string {
+	name := e.Name
+	if strings.Contains(e.Name, " ") {
+		name = fmt.Sprintf("'%s'", e.Name)
+	}
+	return fmt.Sprintf("%s %s %d %s", name, e.Type, e.Size, e.Time)
 }
 
 // Response represents a data-connection
@@ -71,11 +92,19 @@ func Dial(addr string) (*ServerConn, error) {
 // It is generally followed by a call to Login() as most FTP commands require
 // an authenticated user.
 func DialImplicitTLS(addr string, config *tls.Config) (*ServerConn, error) {
+	fmt.Println("connecting", addr)
 	tconn, err := tls.Dial("tcp", addr, config)
 	if err != nil {
 		return nil, err
 	}
-	return dialServer(tconn, 0)
+	sconn, err := dialServer(tconn, 0)
+	sconn.tlsconfig = config
+	sconn.Debug = true
+	_, _, err = sconn.cmdVerify(StatusCommandOK, "PROT P")
+	if err != nil {
+		return nil, err
+	}
+	return sconn, err
 }
 
 // DialTimeout initializes the connection to the specified ftp server address.
@@ -129,7 +158,7 @@ func dialServer(tconn net.Conn, timeout time.Duration) (*ServerConn, error) {
 // "anonymous"/"anonymous" is a common user/password scheme for FTP servers
 // that allows anonymous read-only accounts.
 func (c *ServerConn) Login(user, password string) error {
-	code, message, err := c.cmd(-1, "USER %s", user)
+	code, message, err := c.cmdVerify(-1, "USER %s", user)
 	if err != nil {
 		return err
 	}
@@ -137,7 +166,7 @@ func (c *ServerConn) Login(user, password string) error {
 	switch code {
 	case StatusLoggedIn:
 	case StatusUserOK:
-		_, _, err = c.cmd(StatusLoggedIn, "PASS %s", password)
+		_, _, err = c.cmdVerify(StatusLoggedIn, "PASS %s", password)
 		if err != nil {
 			return err
 		}
@@ -146,7 +175,7 @@ func (c *ServerConn) Login(user, password string) error {
 	}
 
 	// Switch to binary mode
-	if _, _, err = c.cmd(StatusCommandOK, "TYPE I"); err != nil {
+	if _, _, err = c.cmdVerify(StatusCommandOK, "TYPE I"); err != nil {
 		return err
 	}
 
@@ -160,7 +189,7 @@ func (c *ServerConn) Login(user, password string) error {
 // the remote FTP server.
 // FEAT is described in RFC 2389
 func (c *ServerConn) feat() error {
-	code, message, err := c.cmd(-1, "FEAT")
+	code, message, err := c.cmdVerify(-1, "FEAT")
 	if err != nil {
 		return err
 	}
@@ -199,15 +228,15 @@ func (c *ServerConn) setUTF8() error {
 		return nil
 	}
 
-	code, message, err := c.cmd(-1, "OPTS UTF8 ON")
+	code, message, err := c.cmdVerify(-1, "OPTS UTF8 ON")
 	if err != nil {
 		return err
 	}
 
-        // Workaround for FTP servers, that does not support this option.
-        if code == StatusBadArguments {
-                return nil
-        }
+	// Workaround for FTP servers, that does not support this option.
+	if code == StatusBadArguments {
+		return nil
+	}
 
 	// The ftpd "filezilla-server" has FEAT support for UTF8, but always returns
 	// "202 UTF8 mode is always enabled. No need to send this command." when
@@ -225,7 +254,7 @@ func (c *ServerConn) setUTF8() error {
 
 // epsv issues an "EPSV" command to get a port number for a data connection.
 func (c *ServerConn) epsv() (port int, err error) {
-	_, line, err := c.cmd(StatusExtendedPassiveMode, "EPSV")
+	_, line, err := c.cmdVerify(StatusExtendedPassiveMode, "EPSV")
 	if err != nil {
 		return
 	}
@@ -242,7 +271,7 @@ func (c *ServerConn) epsv() (port int, err error) {
 
 // pasv issues a "PASV" command to get a port number for a data connection.
 func (c *ServerConn) pasv() (host string, port int, err error) {
-	_, line, err := c.cmd(StatusPassiveMode, "PASV")
+	_, line, err := c.cmdVerify(StatusPassiveMode, "PASV")
 	if err != nil {
 		return
 	}
@@ -306,18 +335,43 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 		return nil, err
 	}
 
-	return net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), c.timeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), c.timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	if c.tlsconfig != nil {
+		conn = tls.Client(conn, c.tlsconfig)
+	}
+	return conn, err
 }
 
-// cmd is a helper function to execute a command and check for the expected FTP
+// cmd is a wrapper for textproto Conn.Cmd with debug
+func (c *ServerConn) cmd(format string, args ...interface{}) (id uint, err error) {
+	if c.Debug {
+		fmt.Printf("> "+format+"\n", args...)
+	}
+	return c.conn.Cmd(format, args...)
+}
+
+// readResponse is a wrapper for textproto Conn.ReadResponse with debug
+func (c *ServerConn) readResponse(expectCode int) (code int, message string, err error) {
+	code, message, err = c.conn.ReadResponse(expectCode)
+	if err == nil && c.Debug {
+		fmt.Printf("< %d %s\n", code, message)
+	}
+	return
+}
+
+// cmdVerify is a helper function to execute a command and check for the expected FTP
 // return code
-func (c *ServerConn) cmd(expected int, format string, args ...interface{}) (int, string, error) {
-	_, err := c.conn.Cmd(format, args...)
+func (c *ServerConn) cmdVerify(expected int, format string, args ...interface{}) (int, string, error) {
+	_, err := c.cmd(format, args...)
 	if err != nil {
 		return 0, "", err
 	}
 
-	return c.conn.ReadResponse(expected)
+	return c.readResponse(expected)
 }
 
 // cmdDataConnFrom executes a command which require a FTP data connection.
@@ -329,20 +383,20 @@ func (c *ServerConn) cmdDataConnFrom(offset uint64, format string, args ...inter
 	}
 
 	if offset != 0 {
-		_, _, err := c.cmd(StatusRequestFilePending, "REST %d", offset)
+		_, _, err := c.cmdVerify(StatusRequestFilePending, "REST %d", offset)
 		if err != nil {
 			conn.Close()
 			return nil, err
 		}
 	}
 
-	_, err = c.conn.Cmd(format, args...)
+	_, err = c.cmd(format, args...)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 
-	code, msg, err := c.conn.ReadResponse(-1)
+	code, msg, err := c.readResponse(-1)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -413,7 +467,7 @@ func (c *ServerConn) List(path string) (entries []*Entry, err error) {
 // ChangeDir issues a CWD FTP command, which changes the current directory to
 // the specified path.
 func (c *ServerConn) ChangeDir(path string) error {
-	_, _, err := c.cmd(StatusRequestedFileActionOK, "CWD %s", path)
+	_, _, err := c.cmdVerify(StatusRequestedFileActionOK, "CWD %s", path)
 	return err
 }
 
@@ -421,14 +475,14 @@ func (c *ServerConn) ChangeDir(path string) error {
 // directory to the parent directory.  This is similar to a call to ChangeDir
 // with a path set to "..".
 func (c *ServerConn) ChangeDirToParent() error {
-	_, _, err := c.cmd(StatusRequestedFileActionOK, "CDUP")
+	_, _, err := c.cmdVerify(StatusRequestedFileActionOK, "CDUP")
 	return err
 }
 
 // CurrentDir issues a PWD FTP command, which Returns the path of the current
 // directory.
 func (c *ServerConn) CurrentDir() (string, error) {
-	_, msg, err := c.cmd(StatusPathCreated, "PWD")
+	_, msg, err := c.cmdVerify(StatusPathCreated, "PWD")
 	if err != nil {
 		return "", err
 	}
@@ -445,7 +499,7 @@ func (c *ServerConn) CurrentDir() (string, error) {
 
 // FileSize issues a SIZE FTP command, which Returns the size of the file
 func (c *ServerConn) FileSize(path string) (int64, error) {
-	_, msg, err := c.cmd(StatusFile, "SIZE %s", path)
+	_, msg, err := c.cmdVerify(StatusFile, "SIZE %s", path)
 	if err != nil {
 		return 0, err
 	}
@@ -499,25 +553,25 @@ func (c *ServerConn) StorFrom(path string, r io.Reader, offset uint64) error {
 		return err
 	}
 
-	_, _, err = c.conn.ReadResponse(StatusClosingDataConnection)
+	_, _, err = c.readResponse(StatusClosingDataConnection)
 	return err
 }
 
 // Rename renames a file on the remote FTP server.
 func (c *ServerConn) Rename(from, to string) error {
-	_, _, err := c.cmd(StatusRequestFilePending, "RNFR %s", from)
+	_, _, err := c.cmdVerify(StatusRequestFilePending, "RNFR %s", from)
 	if err != nil {
 		return err
 	}
 
-	_, _, err = c.cmd(StatusRequestedFileActionOK, "RNTO %s", to)
+	_, _, err = c.cmdVerify(StatusRequestedFileActionOK, "RNTO %s", to)
 	return err
 }
 
 // Delete issues a DELE FTP command to delete the specified file from the
 // remote FTP server.
 func (c *ServerConn) Delete(path string) error {
-	_, _, err := c.cmd(StatusRequestedFileActionOK, "DELE %s", path)
+	_, _, err := c.cmdVerify(StatusRequestedFileActionOK, "DELE %s", path)
 	return err
 }
 
@@ -559,14 +613,14 @@ func (c *ServerConn) RemoveDirRecur(path string) error {
 // MakeDir issues a MKD FTP command to create the specified directory on the
 // remote FTP server.
 func (c *ServerConn) MakeDir(path string) error {
-	_, _, err := c.cmd(StatusPathCreated, "MKD %s", path)
+	_, _, err := c.cmdVerify(StatusPathCreated, "MKD %s", path)
 	return err
 }
 
 // RemoveDir issues a RMD FTP command to remove the specified directory from
 // the remote FTP server.
 func (c *ServerConn) RemoveDir(path string) error {
-	_, _, err := c.cmd(StatusRequestedFileActionOK, "RMD %s", path)
+	_, _, err := c.cmdVerify(StatusRequestedFileActionOK, "RMD %s", path)
 	return err
 }
 
@@ -574,20 +628,20 @@ func (c *ServerConn) RemoveDir(path string) error {
 // NOOP has no effects and is usually used to prevent the remote FTP server to
 // close the otherwise idle connection.
 func (c *ServerConn) NoOp() error {
-	_, _, err := c.cmd(StatusCommandOK, "NOOP")
+	_, _, err := c.cmdVerify(StatusCommandOK, "NOOP")
 	return err
 }
 
 // Logout issues a REIN FTP command to logout the current user.
 func (c *ServerConn) Logout() error {
-	_, _, err := c.cmd(StatusReady, "REIN")
+	_, _, err := c.cmdVerify(StatusReady, "REIN")
 	return err
 }
 
 // Quit issues a QUIT FTP command to properly close the connection from the
 // remote FTP server.
 func (c *ServerConn) Quit() error {
-	c.conn.Cmd("QUIT")
+	c.cmd("QUIT")
 	return c.conn.Close()
 }
 
@@ -603,9 +657,11 @@ func (r *Response) Close() error {
 		return nil
 	}
 	err := r.conn.Close()
-	_, _, err2 := r.c.conn.ReadResponse(StatusClosingDataConnection)
+	code, msg, err2 := r.c.conn.ReadResponse(StatusClosingDataConnection)
 	if err2 != nil {
 		err = err2
+	} else if r.c.Debug {
+		fmt.Printf("< %d %s\n", code, msg)
 	}
 	r.closed = true
 	return err
