@@ -42,16 +42,16 @@ type ServerConn struct {
 	// Do not use EPSV mode
 	DisableEPSV bool
 	Debug       bool
+	TlsConfig   *tls.Config
+	Timeout     time.Duration
 
 	// Timezone that the server is in
 	Location *time.Location
 
 	conn          *textproto.Conn
 	host          string
-	timeout       time.Duration
 	features      map[string]string
 	mlstSupported bool
-	tlsconfig     *tls.Config
 }
 
 // Entry describes a file and is returned by List().
@@ -92,19 +92,17 @@ func Dial(addr string) (*ServerConn, error) {
 // It is generally followed by a call to Login() as most FTP commands require
 // an authenticated user.
 func DialImplicitTLS(addr string, config *tls.Config) (*ServerConn, error) {
-	fmt.Println("connecting", addr)
 	tconn, err := tls.Dial("tcp", addr, config)
 	if err != nil {
 		return nil, err
 	}
-	sconn, err := dialServer(tconn, 0)
-	sconn.tlsconfig = config
-	sconn.Debug = true
-	_, _, err = sconn.cmdVerify(StatusCommandOK, "PROT P")
+	c, err := dialServer(tconn, 0)
+	c.TlsConfig = config
+	err = c.setPROT()
 	if err != nil {
 		return nil, err
 	}
-	return sconn, err
+	return c, err
 }
 
 // DialTimeout initializes the connection to the specified ftp server address.
@@ -129,8 +127,8 @@ func dialServer(tconn net.Conn, timeout time.Duration) (*ServerConn, error) {
 	c := &ServerConn{
 		conn:     conn,
 		host:     remoteAddr.IP.String(),
-		timeout:  timeout,
 		features: make(map[string]string),
+		Timeout:  timeout,
 		Location: time.UTC,
 	}
 
@@ -151,6 +149,59 @@ func dialServer(tconn net.Conn, timeout time.Duration) (*ServerConn, error) {
 	}
 
 	return c, nil
+}
+
+// Dial will use the connection details that you've set on it
+func (c *ServerConn) Dial(addr string) error {
+	if c.conn != nil {
+		fmt.Println("# WARN: Already connected. No need to dial again.")
+		return nil
+	}
+	if c.Location == nil {
+		c.Location = time.UTC
+	}
+
+	var conn net.Conn
+	var err error
+	if c.Debug {
+		fmt.Printf("> CONNECT %s\n", addr)
+	}
+	if c.TlsConfig != nil {
+		conn, err = tls.Dial("tcp", addr, c.TlsConfig)
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, c.Timeout)
+	}
+	if err != nil {
+		return err
+	}
+	c.conn = textproto.NewConn(conn)
+	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
+	c.host = remoteAddr.IP.String()
+	c.features = make(map[string]string)
+
+	_, _, err = c.readResponse(StatusReady)
+	if err != nil {
+		c.Quit()
+		return err
+	}
+
+	err = c.feat()
+	if err != nil {
+		c.Quit()
+		return err
+	}
+
+	if _, mlstSupported := c.features["MLST"]; mlstSupported {
+		c.mlstSupported = true
+	}
+
+	if c.TlsConfig != nil {
+		if err = c.setPROT(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Login authenticates the client with specified user and password.
@@ -220,6 +271,24 @@ func (c *ServerConn) feat() error {
 	}
 
 	return nil
+}
+
+// setPROT negoiates using TLS on the data connection
+func (c *ServerConn) setPROT() error {
+	// RFC2228 claims that PBSZ must be set before PROT
+	if _, ok := c.features["PBSZ"]; !ok {
+		return nil
+	}
+	_, _, err := c.cmdVerify(StatusCommandOK, "PBSZ 0")
+	if err != nil {
+		return err
+	}
+
+	if _, ok := c.features["PROT"]; !ok {
+		return nil
+	}
+	_, _, err = c.cmdVerify(StatusCommandOK, "PROT P")
+	return err
 }
 
 // setUTF8 issues an "OPTS UTF8 ON" command.
@@ -335,13 +404,13 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 		return nil, err
 	}
 
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), c.timeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), c.Timeout)
 	if err != nil {
 		return nil, err
 	}
 
-	if c.tlsconfig != nil {
-		conn = tls.Client(conn, c.tlsconfig)
+	if _, ok := c.features["PROT"]; ok && c.TlsConfig != nil {
+		conn = tls.Client(conn, c.TlsConfig)
 	}
 	return conn, err
 }
@@ -657,11 +726,9 @@ func (r *Response) Close() error {
 		return nil
 	}
 	err := r.conn.Close()
-	code, msg, err2 := r.c.conn.ReadResponse(StatusClosingDataConnection)
+	_, _, err2 := r.c.readResponse(StatusClosingDataConnection)
 	if err2 != nil {
 		err = err2
-	} else if r.c.Debug {
-		fmt.Printf("< %d %s\n", code, msg)
 	}
 	r.closed = true
 	return err
