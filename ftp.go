@@ -356,8 +356,10 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 	}
 
 	if _, ok := c.features["PROT"]; ok && c.TLSConfig != nil {
+		fmt.Println("using TLS on data")
 		conn = tls.Client(conn, c.TLSConfig)
 	}
+	fmt.Println("NOT using TLS on data")
 	return conn, err
 }
 
