@@ -602,6 +602,9 @@ func (c *ServerConn) RemoveDirRecur(path string) error {
 		return err
 	}
 	entries, err := c.List(currentDir)
+	if err != nil {
+		return err
+	}
 	for _, entry := range entries {
 		if entry.Name != ".." && entry.Name != "." {
 			if entry.Type == EntryTypeFolder {
