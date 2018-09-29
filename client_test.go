@@ -22,7 +22,13 @@ func isTLSServer() bool {
 
 func getConnection() (*ServerConn, error) {
 	if isTLSServer() {
-		return DialImplicitTLS("localhost:21", &tls.Config{InsecureSkipVerify: true})
+		s := &ServerConn{
+			Debug:     true,
+			Timeout:   30 * time.Second,
+			TLSConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		err := s.Dial("localhost:21")
+		return s, err
 	}
 	return DialTimeout("localhost:21", 5*time.Second)
 }

@@ -1,4 +1,4 @@
-// Package ftp implements a FTP client as described in RFC 959.
+// Package ftp implements a FTP client as described in RFC 959 and an FTPS client as described in RFC 2228
 //
 // A textproto.Error is returned for errors at the protocol level.
 package ftp
@@ -39,14 +39,11 @@ func (e EntryType) String() string {
 // ServerConn represents the connection to a remote FTP server.
 // It should be protected from concurrent accesses.
 type ServerConn struct {
-	// Do not use EPSV mode
-	DisableEPSV bool
-	Debug       bool
-	TlsConfig   *tls.Config
-	Timeout     time.Duration
-
-	// Timezone that the server is in
-	Location *time.Location
+	DisableEPSV bool           // Do not use EPSV mode
+	Debug       bool           // Display the commands and responses
+	TLSConfig   *tls.Config    // FTPS with implicit TLS on both command and data channels
+	Timeout     time.Duration  // Timeout setting
+	Location    *time.Location // Timezone that the server is in
 
 	conn          *textproto.Conn
 	host          string
@@ -87,68 +84,17 @@ func Dial(addr string) (*ServerConn, error) {
 	return DialTimeout(addr, 0)
 }
 
-// DialImplicitTLS initializes the connection to the specified ftp server with implicit TLS
-//
-// It is generally followed by a call to Login() as most FTP commands require
-// an authenticated user.
-func DialImplicitTLS(addr string, config *tls.Config) (*ServerConn, error) {
-	tconn, err := tls.Dial("tcp", addr, config)
-	if err != nil {
-		return nil, err
-	}
-	c, err := dialServer(tconn, 0)
-	c.TlsConfig = config
-	err = c.setPROT()
-	if err != nil {
-		return nil, err
-	}
-	return c, err
-}
-
 // DialTimeout initializes the connection to the specified ftp server address.
 //
 // It is generally followed by a call to Login() as most FTP commands require
 // an authenticated user.
 func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
-	tconn, err := net.DialTimeout("tcp", addr, timeout)
-	if err != nil {
-		return nil, err
-	}
-	return dialServer(tconn, timeout)
-}
-
-func dialServer(tconn net.Conn, timeout time.Duration) (*ServerConn, error) {
-	// Use the resolved IP address in case addr contains a domain name
-	// If we use the domain name, we might not resolve to the same IP.
-	remoteAddr := tconn.RemoteAddr().(*net.TCPAddr)
-
-	conn := textproto.NewConn(tconn)
-
 	c := &ServerConn{
-		conn:     conn,
-		host:     remoteAddr.IP.String(),
-		features: make(map[string]string),
 		Timeout:  timeout,
 		Location: time.UTC,
 	}
-
-	_, _, err := c.conn.ReadResponse(StatusReady)
-	if err != nil {
-		c.Quit()
-		return nil, err
-	}
-
-	err = c.feat()
-	if err != nil {
-		c.Quit()
-		return nil, err
-	}
-
-	if _, mlstSupported := c.features["MLST"]; mlstSupported {
-		c.mlstSupported = true
-	}
-
-	return c, nil
+	err := c.Dial(addr)
+	return c, err
 }
 
 // Dial will use the connection details that you've set on it
@@ -166,8 +112,8 @@ func (c *ServerConn) Dial(addr string) error {
 	if c.Debug {
 		fmt.Printf("> CONNECT %s\n", addr)
 	}
-	if c.TlsConfig != nil {
-		conn, err = tls.Dial("tcp", addr, c.TlsConfig)
+	if c.TLSConfig != nil {
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: c.Timeout}, "tcp", addr, c.TLSConfig)
 	} else {
 		conn, err = net.DialTimeout("tcp", addr, c.Timeout)
 	}
@@ -195,7 +141,7 @@ func (c *ServerConn) Dial(addr string) error {
 		c.mlstSupported = true
 	}
 
-	if c.TlsConfig != nil {
+	if c.TLSConfig != nil {
 		if err = c.setPROT(); err != nil {
 			return err
 		}
@@ -409,8 +355,8 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 		return nil, err
 	}
 
-	if _, ok := c.features["PROT"]; ok && c.TlsConfig != nil {
-		conn = tls.Client(conn, c.TlsConfig)
+	if _, ok := c.features["PROT"]; ok && c.TLSConfig != nil {
+		conn = tls.Client(conn, c.TLSConfig)
 	}
 	return conn, err
 }
