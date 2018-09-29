@@ -29,7 +29,7 @@ func getConnection() (*ServerConn, error) {
 			Timeout:   30 * time.Second,
 			TLSConfig: &tls.Config{InsecureSkipVerify: true},
 		}
-		err := s.Dial("localhost:21")
+		err := s.Dial("localhost:990")
 		return s, err
 	}
 	return DialTimeout("localhost:21", 5*time.Second)
