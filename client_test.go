@@ -149,6 +149,7 @@ func testConn(t *testing.T, disableEPSV bool, implicitTLS bool) {
 		t.Errorf("file size %q, expected %q", fileSize, 14)
 	}
 
+	approxModTime := time.Now()
 	data = bytes.NewBufferString("")
 	err = c.Stor("tset", data)
 	if err != nil {
@@ -163,7 +164,21 @@ func testConn(t *testing.T, disableEPSV bool, implicitTLS bool) {
 		t.Errorf("file size %q, expected %q", fileSize, 0)
 	}
 
+	modTime, err := c.ModTime("tset")
+	if err != nil {
+		t.Error(err)
+	}
+	now := time.Now()
+	if modTime.After(approxModTime) && modTime.Before(now) {
+		t.Errorf("modtime %v, expected to be between %v and %v", modTime, approxModTime, now)
+	}
+
 	_, err = c.FileSize("not-found")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	_, err = c.ModTime("not-found")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
