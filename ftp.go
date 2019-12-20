@@ -522,6 +522,17 @@ func (c *ServerConn) FileSize(path string) (int64, error) {
 	return strconv.ParseInt(msg, 10, 64)
 }
 
+// ModTime issues a MDTM FTP command, which returns the last modified time of the file
+func (c *ServerConn) ModTime(path string) (time.Time, error) {
+	_, msg, err := c.cmdVerify(StatusFile, "MDTM %s", path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	format := "20060102150405"
+	modTime, err := time.Parse(format, msg)
+	return modTime, err
+}
+
 // Retr issues a RETR FTP command to fetch the specified file from the remote
 // FTP server.
 //
